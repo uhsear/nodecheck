@@ -22,13 +22,70 @@ There is no PASS. OBSERVED is evidence about one moment, not a promise that
 the install will work.
 
     python nodecheck.py --self-test
+    python nodecheck.py example > nodes.json
     python nodecheck.py gather nodes.json --node node-a
     python nodecheck.py gather nodes.json --node node-a --out facts/node-a.json --apply
     python nodecheck.py check nodes.json
     python nodecheck.py check nodes.json --node node-a
     python nodecheck.py mof dsc/node-a.mof dsc/node-b.mof
 
-Nothing is written without --apply, and only gather --out writes.
+Nothing is written without --apply, and only gather --out writes. It creates
+the folder, and it replaces an existing file only if that file is a nodecheck
+facts file.
+
+THE NODE TABLE (JSON, UTF-8 or UTF-16 with a byte order mark). The example
+command prints a complete one. A key the format does not name is refused, so a
+misspelt "requires" cannot drop checks. A key that appears twice is refused.
+
+    format         "nodecheck/1". Required.
+    max_age_hours  A positive number. Optional, default 24. A facts file older
+                   than this, or dated more than 5 minutes ahead, is not used.
+    roles          Optional. Role name -> list of requirements.
+    nodes          Required, non-empty. Each node has:
+        name       Required, unique.
+        roles      Optional list of role names. Their requirements join the
+                   node's own. A repeated requirement counts once.
+        facts      A path or a list of paths to facts files, relative to the
+                   table's folder. Optional, but a node with none is UNVERIFIED.
+        requires   Optional list of requirements.
+    note           Optional text, on the table or on a node. Ignored.
+
+A requirement is {"fact": KEY, "op": OP, "value": V, "why": TEXT}. The why is
+optional. OP is one of:
+
+    ==         the fact equals V (string, number or boolean; a boolean never
+               equals a number)
+    >=         the fact is a number and is at least V
+    version>=  the fact is a dotted version and is at least V (18.3 = 18.3.0)
+    contains   the fact is a list that holds V
+    excludes   the fact is a list that holds none of V (V is a list)
+    in         the fact is one of V (V is a list)
+
+A fact KEY names what to observe. gather has a collector for these keys only:
+
+    tcp:HOST:PORT      true if a connection opens, false if it is refused.
+                       Anything else (timeout, no route) is an error.
+    disk_free_gb:PATH  free GiB at PATH, cut down to 0.1.
+    odbc_drivers       list of installed ODBC drivers (Windows, 64-bit view).
+    mof:PATH           ENCRYPTED, PLAINTEXT or NO_MSFT_CREDENTIAL for a
+                       compiled DSC MOF, PATH relative to the table. A MOF
+                       that is UNVERIFIED is an error.
+    os.system, os.release, os.version, os.machine   text from platform.
+
+Any other key is supplied by hand. gather records "no collector for this fact"
+under errors and exits 3. To supply the value, edit the gathered file: delete
+the key under errors and add it under facts. Do not put it in a second file,
+because a value in one file and an error in another file conflict.
+
+THE FACTS FILE (format "nodecheck-facts/1"), written by gather --apply:
+
+    {"format": "nodecheck-facts/1", "node": "node-a",
+     "gathered": "2026-01-31T12:00:00Z", "gathered_on": "host name",
+     "facts": {KEY: value}, "errors": {KEY: "why it could not be observed"}}
+
+A requirement is judged on a value in "facts". A key in "errors", a missing
+key, a stale file or a file for another node gives UNVERIFIED. Two files that
+disagree about one key give UNVERIFIED.
 
 Exit codes: 0 every requirement OBSERVED (mof: every credential encrypted or
 none present), 1 at least one FAIL (mof: a plaintext password), 2 a file could
@@ -57,6 +114,7 @@ import socket
 import sys
 import tempfile
 import threading
+import urllib.request
 
 # Only Windows has a registry. Elsewhere the ODBC probe records an error, and
 # the requirement that needed it is UNVERIFIED rather than FAIL.
@@ -81,6 +139,43 @@ CLOCK_SKEW_HOURS = 5.0 / 60.0
 TCP_TIMEOUT = 3.0
 
 # =============================================================================
+
+# What the example command prints. Every name in it is made up. The self-test
+# loads it, so it cannot drift away from the format.
+EXAMPLE_TABLE = r'''{
+  "format": "nodecheck/1",
+  "note": "Synthetic example. Every name here is made up.",
+  "max_age_hours": 24,
+  "roles": {
+    "server": [
+      {"fact": "os.system", "op": "==", "value": "Windows",
+       "why": "the installer is for Windows"},
+      {"fact": "odbc_drivers", "op": "contains",
+       "value": "ODBC Driver 18 for SQL Server",
+       "why": "the connection files name this driver"},
+      {"fact": "disk_free_gb:C:\\", "op": ">=", "value": 40},
+      {"fact": "tcp:db.example.test:1433", "op": "==", "value": true,
+       "why": "the database port answers"}
+    ],
+    "sql-host": [
+      {"fact": "linked_server_providers", "op": "excludes",
+       "value": ["SQLNCLI", "SQLNCLI11"],
+       "why": "supplied by hand: no collector exists for it"}
+    ],
+    "authoring": [
+      {"fact": "mof:dsc/node-a.mof", "op": "in",
+       "value": ["ENCRYPTED", "NO_MSFT_CREDENTIAL"]}
+    ]
+  },
+  "nodes": [
+    {"name": "node-a", "roles": ["server", "authoring"],
+     "facts": "facts/node-a.json"},
+    {"name": "node-b", "roles": ["server", "sql-host"],
+     "facts": ["facts/node-b.json", "facts/node-b-authoring.json"],
+     "requires": [{"fact": "license_seats", "op": ">=", "value": 4}]}
+  ]
+}
+'''
 
 TABLE_FORMAT = "nodecheck/1"
 FACTS_FORMAT = "nodecheck-facts/1"
@@ -108,7 +203,7 @@ ODBC_DRIVERS_KEY = r"SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers"
 # mofcheck verdicts.
 MOF_ENCRYPTED = "ENCRYPTED"
 MOF_PLAINTEXT = "PLAINTEXT"
-MOF_NONE = "NO_CREDENTIALS"
+MOF_NONE = "NO_MSFT_CREDENTIAL"
 
 CMS_BEGIN = "-----BEGIN CMS-----"
 CMS_END = "-----END CMS-----"
@@ -125,8 +220,10 @@ class InputError(Exception):
 # ------------------------------------------------------------------ the table
 
 def _is_number(value):
+    # Compare with the largest float, not math.isfinite: isfinite raises
+    # OverflowError on an integer of more than 308 digits.
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value))
+            and -sys.float_info.max <= value <= sys.float_info.max)
 
 
 def _kind(value):
@@ -180,7 +277,8 @@ def split_tcp(key):
     host, sep, port = key[len("tcp:"):].rpartition(":")
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
-    if not sep or not host or not re.match(r"\A\d{1,5}\Z", port) \
+    if not sep or not host \
+            or not re.match(r"\A\d{1,5}\Z", port, re.ASCII) \
             or not 0 < int(port) < 65536:
         raise ValueError("%s: a TCP fact is tcp:HOST:PORT with a port from 1 "
                          "to 65535" % key)
@@ -518,11 +616,48 @@ def gate(results):
 _INSTANCE_RE = re.compile(
     r"instance\s+of\s+(\w+)(?:\s+as\s+(\$\w+))?\s*\{", re.IGNORECASE)
 
+# One token of MOF text: a string literal (closed or not), a // comment, a
+# /* */ comment (closed or not), a run of anything else, or a lone slash.
+_TOKEN_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"?|//[^\r\n]*|/\*.*?(?:\*/|\Z)|[^"/]+|/', re.DOTALL)
+_SPACE_RE = re.compile(r"\s*")
+_PROP_RE = re.compile(r"(\w+)\s*=\s*")
+_BARE_RE = re.compile(r'[^;,"{}]*')
+
+
+def strip_comments(text):
+    """text with every MOF comment replaced by spaces. Newlines are kept.
+
+    DSP0221 clause 5.4: a comment is whitespace, and // or /* inside a string
+    literal is not a comment. Without this, an "instance of MSFT_Credential"
+    written inside a comment would be read as a live credential. A block
+    comment that is never closed raises ValueError: the specification ends it
+    at the end of the file, but a file cut short is not a file this tool can
+    vouch for.
+    """
+    out = []
+    for match in _TOKEN_RE.finditer(text):
+        token = match.group(0)
+        if token.startswith("//"):
+            out.append(" " * len(token))
+        elif token.startswith("/*"):
+            if not (len(token) >= 4 and token.endswith("*/")):
+                raise ValueError("a block comment is never closed")
+            out.append(re.sub(r"[^\r\n]", " ", token))
+        else:
+            out.append(token)
+    return "".join(out)
+
 
 def _mof_string(text, i):
-    """Parse one MOF string literal at text[i] == '"'. Returns (value, end)."""
-    escapes = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", "\"": "\"",
-               "'": "'"}
+    """Parse one MOF string literal at text[i] == '"'. Returns (value, end).
+
+    The escapes are the ones DSP0221 clause 7.6.1.3 lists, except the hex
+    escape (backslash, x, digits), which is refused. The error never names
+    the character after the backslash: in a password it is part of the secret.
+    """
+    escapes = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f",
+               "\\": "\\", "\"": "\"", "'": "'"}
     out = []
     i += 1
     while i < len(text):
@@ -530,7 +665,7 @@ def _mof_string(text, i):
         if ch == "\\":
             nxt = text[i + 1:i + 2]
             if nxt not in escapes:
-                raise ValueError("unknown escape \\%s" % nxt)
+                raise ValueError("an unknown escape sequence in a string")
             out.append(escapes[nxt])
             i += 2
         elif ch == "\"":
@@ -541,35 +676,52 @@ def _mof_string(text, i):
     raise ValueError("a string is not closed")
 
 
+def _mof_value(text, i):
+    """One property value at text[i]. Returns (value, end).
+
+    A string is a str. Adjacent string literals join into one (DSP0221 clause
+    7.6.1.3). An array is ("array", count) and anything else, such as NULL or
+    a $reference, is ("bare", token).
+    """
+    if text.startswith("\"", i):
+        value, i = _mof_string(text, i)
+        while text.startswith("\"", _SPACE_RE.match(text, i).end()):
+            more, i = _mof_string(text, _SPACE_RE.match(text, i).end())
+            value += more
+        return value, i
+    if text.startswith("{", i):
+        i = _SPACE_RE.match(text, i + 1).end()
+        count = 0
+        while not text.startswith("}", i):
+            _, i = _mof_value(text, i)
+            count += 1
+            i = _SPACE_RE.match(text, i).end()
+            if text.startswith(",", i):
+                i = _SPACE_RE.match(text, i + 1).end()
+            elif not text.startswith("}", i):
+                raise ValueError("an array is not closed")
+        return ("array", count), i + 1
+    bare = _BARE_RE.match(text, i)
+    return ("bare", bare.group(0).strip()), bare.end()
+
+
 def _mof_body(text, start):
     """Properties of the instance whose '{' ends at start. (dict, end).
 
-    Keys are lower case. A string value is a str; anything else, such as NULL
-    or a $reference, is kept as ('bare', token).
-    shortcut: no comments or array values inside a body; DSC writes neither
-    into MSFT_Credential or OMI_ConfigurationDocument. Upgrade if a MOF from
-    another generator is refused here.
+    Keys are lower case. Comments must already be removed (strip_comments).
     """
     props = {}
     i = start
     while True:
-        while i < len(text) and text[i].isspace():
-            i += 1
+        i = _SPACE_RE.match(text, i).end()
         if text.startswith("}", i):
             return props, i + 1
-        match = re.compile(r"(\w+)\s*=\s*").match(text, i)
+        match = _PROP_RE.match(text, i)
         if not match:
             raise ValueError("cannot read a property at offset %d" % i)
         name = match.group(1).lower()
-        i = match.end()
-        if text.startswith("\"", i):
-            value, i = _mof_string(text, i)
-        else:
-            bare = re.compile(r"[^;\"}]*").match(text, i)
-            value = ("bare", bare.group(0).strip())
-            i = bare.end()
-        while i < len(text) and text[i].isspace():
-            i += 1
+        value, i = _mof_value(text, match.end())
+        i = _SPACE_RE.match(text, i).end()
         if not text.startswith(";", i):
             raise ValueError("property %s is not ended by ;" % name)
         props[name] = value
@@ -635,14 +787,45 @@ def classify_password(value):
     return MOF_ENCRYPTED, "CMS EnvelopedData, %d bytes" % len(der)
 
 
+def _document_row(reason):
+    return UNVERIFIED, [(0, "(document)", UNVERIFIED, reason)]
+
+
+def _password_verdict(password):
+    """(verdict, reason) for a Password that is not a string literal.
+
+    The reason never repeats the token. An unquoted token is a password
+    written in the clear, so it is PLAINTEXT, not merely unreadable.
+    """
+    kind, token = password
+    if kind == "array":
+        return UNVERIFIED, "Password is an array, not a string"
+    if token.upper() == "NULL":
+        return UNVERIFIED, "Password is NULL, not a string"
+    if token.startswith("$"):
+        return UNVERIFIED, "Password is a reference, not a string"
+    return MOF_PLAINTEXT, "Password is not a quoted string: it is readable"
+
+
 def mof_verdict(text):
     """(verdict, findings) for one MOF document.
 
     findings is a list of (line, alias, verdict, reason), one per credential,
-    plus one document-level row when the encryption marker disagrees.
+    plus one document-level row when the encryption marker disagrees. Text
+    that holds no MSFT_Credential and no OMI_ConfigurationDocument instance is
+    UNVERIFIED, not clean: a compiled MOF always ends with the document, so
+    an empty file or a file of another kind was not a MOF this tool read.
     """
+    if "\x00" in text:
+        return _document_row("the text holds NUL characters, so it is not "
+                             "UTF-8 or UTF-16 with a byte order mark")
+    try:
+        text = strip_comments(text)
+    except ValueError as exc:
+        return _document_row(str(exc))
     findings = []
     marker = False
+    seen = False
     for match in _INSTANCE_RE.finditer(text):
         cls = match.group(1).lower()
         if cls not in ("msft_credential", "omi_configurationdocument"):
@@ -653,9 +836,11 @@ def mof_verdict(text):
             props, _ = _mof_body(text, match.end())
         except ValueError as exc:
             if cls == "msft_credential":
+                seen = True
                 findings.append((line, alias, UNVERIFIED,
                                  "cannot parse the instance: %s" % exc))
             continue
+        seen = True
         if cls == "omi_configurationdocument":
             marker = marker or props.get("contenttype") == "PasswordEncrypted"
             continue
@@ -664,12 +849,15 @@ def mof_verdict(text):
             findings.append((line, alias, UNVERIFIED,
                              "the credential has no Password property"))
         elif isinstance(password, tuple):
-            findings.append((line, alias, UNVERIFIED,
-                             "Password is %s, not a string" % password[1]))
+            verdict, reason = _password_verdict(password)
+            findings.append((line, alias, verdict, reason))
         else:
             verdict, reason = classify_password(password)
             findings.append((line, alias, verdict, reason))
     verdicts = [f[2] for f in findings]
+    if not seen:
+        return _document_row("not a DSC MOF: no MSFT_Credential or "
+                             "OMI_ConfigurationDocument instance was found")
     if not findings:
         return MOF_NONE, findings
     if MOF_PLAINTEXT in verdicts:
@@ -686,8 +874,12 @@ def mof_verdict(text):
     return MOF_ENCRYPTED, findings
 
 
-def decode_mof(raw):
-    """MOF bytes to text. UTF-16 and UTF-8 with or without a BOM."""
+def decode_text(raw):
+    """File bytes to text: UTF-16 with a BOM, or UTF-8 with or without one.
+
+    Windows PowerShell 5 writes UTF-16 with a BOM from Out-File and from the
+    redirect operator, so a MOF, a table or a facts file can arrive that way.
+    """
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return raw.decode("utf-16")
     try:
@@ -698,29 +890,31 @@ def decode_mof(raw):
 
 def read_mof(path):
     with open(path, "rb") as handle:
-        return decode_mof(handle.read())
+        return decode_text(handle.read())
 
 
 # ------------------------------------------------------------------ gather
 
 def tcp_open(host, port, connect=socket.create_connection):
-    """True when a TCP connection opens, False when it is refused or times out.
+    """True when a TCP connection opens, False when it is refused.
 
-    A name that does not resolve raises, so the fact is recorded as an error:
-    the probe never reached the port, so it observed nothing about it.
+    Only a refusal proves the port is closed: the host answered and said no.
+    A timeout, an unreachable network and a name that does not resolve all
+    raise, so collect records an error. The probe never reached the port, and
+    "closed" would be a made-up observation.
     """
     try:
         conn = connect((host, port), TCP_TIMEOUT)
-    except socket.gaierror:
-        raise
-    except OSError:
+    except ConnectionRefusedError:
         return False
     conn.close()
     return True
 
 
-def disk_free_gb(path):
-    return round(shutil.disk_usage(path).free / float(1024 ** 3), 1)
+def disk_free_gb(path, usage=shutil.disk_usage):
+    """Free GiB (1024 ** 3 bytes) cut down to 0.1. Rounding up would let 39.96
+    GiB meet a requirement of 40."""
+    return math.floor(usage(path).free / float(1024 ** 3) * 10) / 10.0
 
 
 def odbc_drivers(reg=_WINREG):
@@ -795,16 +989,77 @@ def gather(node, keys, base, now, probes=None, host=None):
 
 # ------------------------------------------------------------------ I/O
 
+def _no_repeated_key(pairs):
+    # json.load keeps the last of two equal keys. A second "requires" in a node
+    # would silently drop the first block of checks.
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("the key %s appears twice in one object"
+                             % json.dumps(key))
+        out[key] = value
+    return out
+
+
+def _refuse_constant(name):
+    raise ValueError("%s is not a JSON number" % name)
+
+
+def _refuse_overflow(text):
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("%s is too large for a number" % text)
+    return value
+
+
 def _read_json(path):
-    with open(path, "r", encoding="utf-8-sig") as handle:
-        try:
-            return json.load(handle)
-        except ValueError as exc:
-            raise InputError("%s: not valid JSON: %s" % (path, exc))
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    try:
+        text = decode_text(raw)
+        if "\x00" in text:
+            raise ValueError("the file holds NUL characters. Save it as UTF-8 "
+                             "or as UTF-16 with a byte order mark")
+        return json.loads(text, object_pairs_hook=_no_repeated_key,
+                          parse_constant=_refuse_constant,
+                          parse_float=_refuse_overflow)
+    except ValueError as exc:
+        raise InputError("%s: not valid JSON: %s" % (path, exc))
+
+
+def _plain(text):
+    """text as printable ASCII. Gathered values, why texts and file names come
+    from files, so a control character or an escape sequence in one must not
+    reach the terminal, and a character the console cannot encode must not
+    stop the report part-way."""
+    def escape(match):
+        code = ord(match.group(0))
+        return ("\\x%02x" if code < 256 else "\\u%04x" if code < 65536
+                else "\\U%08x") % code
+    return re.sub(r"[^\x20-\x7e]", escape, text)
+
+
+def _emit(text, stream=None):
+    print(_plain(text), file=stream)
+
+
+def _check_overwrite(path):
+    """Refuse to replace a file that is not a nodecheck facts file. --out
+    pointed at the node table would otherwise destroy it."""
+    if not os.path.lexists(path):
+        return
+    try:
+        doc = _read_json(path)
+    except (OSError, InputError):
+        doc = None
+    if not isinstance(doc, dict) or doc.get("format") != FACTS_FORMAT:
+        raise OSError("it exists and is not a %s file, so it was not "
+                      "replaced" % FACTS_FORMAT)
 
 
 def _write_atomic(path, text):
     folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
     handle, tmp = tempfile.mkstemp(prefix=".nodecheck-", dir=folder)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as out:
@@ -842,6 +1097,8 @@ def _parse(argv):
                        help="judge every node's facts against the table")
     c.add_argument("table", help="the node table, JSON")
     c.add_argument("--node", help="check only this node")
+    sub.add_parser("example", allow_abbrev=False,
+                   help="print an example node table")
     m = sub.add_parser("mof", allow_abbrev=False,
                        help="find plaintext passwords in compiled DSC MOFs")
     m.add_argument("paths", nargs="+", metavar="MOF")
@@ -856,23 +1113,32 @@ def _find_node(table, name):
                      % (name, ", ".join(n["name"] for n in table["nodes"])))
 
 
+def mof_exit(codes):
+    """The exit code for a run over several MOFs. A readable password (1)
+    outranks a file that could not be read (2), which outranks UNVERIFIED (3).
+    """
+    for code in (1, 2, 3):
+        if code in codes:
+            return code
+    return 0
+
+
 def _cmd_mof(paths):
-    worst = 0
+    codes = []
     for path in paths:
         try:
             verdict, findings = mof_verdict(read_mof(path))
         except (OSError, ValueError) as exc:
-            print("error: %s: %s" % (path, exc), file=sys.stderr)
-            return 2
-        print("%s: %s  %d credential(s)"
+            _emit("error: %s: %s" % (path, exc), sys.stderr)
+            codes.append(2)
+            continue
+        _emit("%s: %s  %d credential(s)"
               % (path, verdict, len([f for f in findings if f[0]])))
         for line, alias, row_verdict, reason in findings:
             where = "line %d %s" % (line, alias) if line else alias
-            print("  %-10s  %s  %s" % (row_verdict, where, reason))
-        code = {MOF_PLAINTEXT: 1, UNVERIFIED: 3}.get(verdict, 0)
-        # 1 outranks 3: a readable password is the finding that matters.
-        worst = max(worst, code) if 1 not in (worst, code) else 1
-    return worst
+            _emit("  %-10s  %s  %s" % (row_verdict, where, reason))
+        codes.append({MOF_PLAINTEXT: 1, UNVERIFIED: 3}.get(verdict, 0))
+    return mof_exit(codes)
 
 
 def _cmd_gather(args, table, base):
@@ -890,15 +1156,16 @@ def _cmd_gather(args, table, base):
     if args.out:
         if args.apply:
             try:
+                _check_overwrite(args.out)
                 _write_atomic(args.out, text)
             except OSError as exc:
-                print("error: could not write %s: %s" % (args.out, exc),
-                      file=sys.stderr)
+                _emit("error: could not write %s: %s" % (args.out, exc),
+                      sys.stderr)
                 return 2
-            print("wrote %s" % args.out, file=sys.stderr)
+            _emit("wrote %s" % args.out, sys.stderr)
         else:
-            print("Check only. %s was not written. Re-run with --apply."
-                  % args.out, file=sys.stderr)
+            _emit("Check only. %s was not written. Re-run with --apply."
+                  % args.out, sys.stderr)
     return 3 if doc["errors"] else 0
 
 
@@ -922,9 +1189,9 @@ def _cmd_check(args, table, base):
                     else exc)
             sources.append((rel, info))
         results.append(evaluate_node(node, sources))
-    print("nodecheck: %s, %d node(s)" % (args.table, len(results)))
+    _emit("nodecheck: %s, %d node(s)" % (args.table, len(results)))
     for line in describe(results):
-        print(line)
+        _emit(line)
     return gate(results)
 
 
@@ -938,21 +1205,24 @@ def main(argv=None):
     if args.self_test:
         return self_test()
     if args.command is None:
-        print("error: name a command: gather, check or mof. Use --self-test "
-              "to verify the tool without any input.", file=sys.stderr)
+        _emit("error: name a command: gather, check, mof or example. Use "
+              "--self-test to verify the tool without any input.", sys.stderr)
         return 64
+    if args.command == "example":
+        sys.stdout.write(EXAMPLE_TABLE)
+        return 0
     if args.command == "mof":
         return _cmd_mof(args.paths)
     if args.command == "gather" and args.apply and not args.out:
-        print("error: --apply needs --out.", file=sys.stderr)
+        _emit("error: --apply needs --out.", sys.stderr)
         return 64
     try:
         table = load_table(_read_json(args.table))
     except (OSError, InputError) as exc:
-        print("error: %s" % exc, file=sys.stderr)
+        _emit("error: %s" % exc, sys.stderr)
         return 2
     except ValueError as exc:
-        print("error: %s: %s" % (args.table, exc), file=sys.stderr)
+        _emit("error: %s: %s" % (args.table, exc), sys.stderr)
         return 64
     base = os.path.dirname(os.path.abspath(args.table))
     try:
@@ -960,7 +1230,7 @@ def main(argv=None):
             return _cmd_gather(args, table, base)
         return _cmd_check(args, table, base)
     except ValueError as exc:
-        print("error: %s" % exc, file=sys.stderr)
+        _emit("error: %s" % exc, sys.stderr)
         return 64
 
 
@@ -974,7 +1244,7 @@ def self_test():
     def check(cond, label):
         if cond:
             passed[0] += 1
-            print("PASS  %s" % label)
+            print("ok    %s" % label)
         else:
             failed.append(label)
             print("FAIL  %s" % label)
@@ -1091,6 +1361,21 @@ def self_test():
     raises(req_error({"fact": "tcp:db.example.test:70000", "op": "==",
                       "value": True}),
            "a tcp port above 65535 is refused", "1 to 65535")
+    raises(req_error({"fact": "tcp:db.example.test:65536", "op": "==",
+                      "value": True}),
+           "a tcp port of 65536 is refused, the first one past the range"
+           "  <-- pinned defect", "1 to 65535")
+    raises(req_error({"fact": "tcp:db.example.test:0", "op": "==",
+                      "value": True}),
+           "a tcp port of 0 is refused, the first one before the range"
+           "  <-- pinned defect", "1 to 65535")
+    check(split_tcp("tcp:db.example.test:65535")[1] == 65535
+          and split_tcp("tcp:db.example.test:1")[1] == 1,
+          "ports 1 and 65535 are accepted, both ends of the range")
+    raises(req_error({"fact": "tcp:db.example.test:\u0661\u0664", "op": "==",
+                      "value": True}),
+           "a tcp port written in non-ASCII digits is refused"
+           "  <-- pinned defect", "1 to 65535")
     raises(req_error({"fact": "tcp::1433", "op": "==", "value": True}),
            "a tcp fact without a host is refused", "tcp:HOST:PORT")
     raises(req_error({"fact": "disk_free_gb: ", "op": ">=", "value": 1}),
@@ -1111,6 +1396,25 @@ def self_test():
           "a dotted version parses with surrounding space")
     raises(lambda: parse_version("1\u00b2"),
            "a superscript digit is not a version digit", "dotted version")
+    check([_kind(v) for v in (True, 1, 1.5, "a", [], None, {})]
+          == ["boolean", "number", "number", "string", "list", "null",
+              "object"], "every JSON shape has its own kind name")
+    check(load_table(table(roles={"s": [{"fact": "x", "op": "version>=",
+                                         "value": "18.3"}]},
+                           nodes=[{"name": "n", "roles": ["s"]}]))
+          ["nodes"][0]["requirements"][0]["value"] == "18.3",
+          "a version>= requirement with a dotted version is loaded")
+    raises(lambda: load_table(table(max_age_hours=10 ** 400)),
+           "a max age of 400 digits is refused, not an OverflowError"
+           "  <-- pinned defect", "max_age_hours")
+    check(apply_op(">=", 10 ** 400, 40)[0] == UNVERIFIED,
+          "an integer of 400 digits is not a usable number, UNVERIFIED"
+          "  <-- pinned defect")
+    check(not _is_number(float("nan")) and not _is_number(float("inf")),
+          "NaN and infinity are not numbers")
+    check(not _show("x" * 98).endswith("...")
+          and _show("x" * 99).endswith("..."),
+          "a value of exactly 100 characters is shown whole, one more is cut")
 
     # ---- facts files: who, when, and whether they count
     now = datetime.datetime(2026, 1, 31, 12, 0, 0,
@@ -1160,6 +1464,16 @@ def self_test():
                       "node-a", now, 24.0)
     check(skew["problem"] is None,
           "four minutes of clock skew is tolerated")
+    edge_skew = read_facts(facts_doc(gathered="2026-01-31T12:05:00Z"),
+                           "node-a", now, 24.0)
+    check(edge_skew["problem"] is None,
+          "exactly the allowed clock skew is tolerated, the limit is "
+          "inclusive  <-- pinned defect")
+    over_skew = read_facts(facts_doc(gathered="2026-01-31T12:05:01Z"),
+                           "node-a", now, 24.0)
+    check("in the future" in over_skew["problem"],
+          "one second past the allowed clock skew is refused"
+          "  <-- pinned defect")
 
     # ---- every op, on every shape of fact
     check(apply_op("==", True, True)[0] == OBSERVED, "== true on true is "
@@ -1208,9 +1522,9 @@ def self_test():
           "excludes on a list without them is OBSERVED")
     check(apply_op("excludes", {"a": 1}, ["a"])[0] == UNVERIFIED,
           "excludes on an object is UNVERIFIED")
-    check(apply_op("in", "ENCRYPTED", ["ENCRYPTED", "NO_CREDENTIALS"])[0]
+    check(apply_op("in", "ENCRYPTED", ["ENCRYPTED", "NO_MSFT_CREDENTIAL"])[0]
           == OBSERVED, "in on a listed value is OBSERVED")
-    check(apply_op("in", "PLAINTEXT", ["ENCRYPTED", "NO_CREDENTIALS"])[0]
+    check(apply_op("in", "PLAINTEXT", ["ENCRYPTED", "NO_MSFT_CREDENTIAL"])[0]
           == FAIL, "in on an unlisted value is FAIL")
     check(apply_op("in", ["ENCRYPTED"], ["ENCRYPTED"])[0] == UNVERIFIED,
           "in on a list is UNVERIFIED")
@@ -1271,6 +1585,13 @@ def self_test():
     report = "\n".join(describe([res, res_fail, res_bare]))
     check("summary: 3 node(s), 3 requirement(s): 1 FAIL, 1 UNVERIFIED, "
           "1 OBSERVED" in report, "the summary counts every verdict")
+    counted = [{"name": "n", "roles": [], "sources": [],
+                "rows": [(FAIL, None, "d")] * 2 + [(UNVERIFIED, None, "d")] * 3
+                + [(OBSERVED, None, "d")]}]
+    check("1 node(s), 6 requirement(s): 2 FAIL, 3 UNVERIFIED, 1 OBSERVED"
+          in "\n".join(describe(counted)),
+          "the summary puts each count under its own verdict, 2 / 3 / 1"
+          "  <-- pinned defect")
     check("Not ready." in report, "a report with a FAIL says not ready")
     report_u = "\n".join(describe([res, res_bare]))
     check("Not shown ready." in report_u and "Not ready." not in report_u,
@@ -1377,11 +1698,14 @@ def self_test():
         for i, pw in enumerate(passwords):
             value = pw if pw.startswith("NULL") else "\"%s\"" % mof_escape(pw)
             parts.append("\ninstance of MSFT_Credential as $MSFT_Credential%d"
-                         "ref\n{\nPassword = %s;\n UserName = \"svc-gis\";\n\n"
+                         "ref\n{\nPassword = %s;\n UserName = \"svc-example\";\n\n"
                          "};\n" % (i + 1, value))
         parts.append(extra)
+        # The header carries an array property, as a compiled MOF does.
         parts.append("\ninstance of OMI_ConfigurationDocument\n{\n "
-                     "Version=\"2.0.0\";\n%s Name=\"Example\";\n};\n"
+                     "Version=\"2.0.0\";\n CompatibleVersionAdditionalProperties"
+                     "= {\"Omi_BaseResource:ConfigurationName\"};\n"
+                     "%s Name=\"Example\";\n};\n"
                      % (" ContentType=\"PasswordEncrypted\";\n"
                         if marker else ""))
         return "".join(parts)
@@ -1401,7 +1725,7 @@ def self_test():
           "CMS credentials without the PasswordEncrypted marker are "
           "UNVERIFIED")
     check(mof_verdict(mof([]))[0] == MOF_NONE,
-          "a MOF with no credential is NO_CREDENTIALS")
+          "a MOF with no credential is NO_MSFT_CREDENTIAL")
     verdict, findings = mof_verdict(mof(["NULL"]))
     check(verdict == UNVERIFIED and "NULL" in findings[0][3],
           "a NULL password is UNVERIFIED")
@@ -1429,14 +1753,107 @@ def self_test():
         "\ninstance of OMI_ConfigurationDocument\n{\n Version 2;\n};\n")
     check(mof_verdict(bad_doc)[0] == UNVERIFIED,
           "an unreadable OMI_ConfigurationDocument is skipped, not a marker")
+    check(mof_verdict(broken)[1][0][2] == UNVERIFIED,
+          "the verdict of a credential that cannot be parsed is UNVERIFIED"
+          "  <-- pinned defect")
+    broken_marked = broken + mof([], marker=True)
+    check(mof_verdict(broken_marked)[0] == UNVERIFIED
+          and mof_verdict(broken_marked)[1][0][2] == UNVERIFIED,
+          "an unparseable credential beside a marked document stays "
+          "UNVERIFIED, the marker does not clear it  <-- pinned defect")
+    check(mof_verdict(mof([armoured]))[0] == MOF_ENCRYPTED
+          and "CompatibleVersionAdditionalProperties" in mof([armoured]),
+          "a document header with an array property still sets the marker"
+          "  <-- pinned defect")
+    for text, label in (("", "an empty file"),
+                        ("   \n", "a file of white space"),
+                        ("{\"format\": \"nodecheck/1\"}", "a JSON file"),
+                        ("instance of MSFT_FileResource as $f\n{\n};\n",
+                         "a MOF with only another class")):
+        verdict, found = mof_verdict(text)
+        check(verdict == UNVERIFIED and found[0][1] == "(document)"
+              and "not a DSC MOF" in found[0][3],
+              "%s is UNVERIFIED, never NO_MSFT_CREDENTIAL"
+              "  <-- pinned defect" % label)
+    check(mof_verdict("instance of MSFT_Credential as $c\n{\n")[0]
+          == UNVERIFIED, "a credential cut short inside its body is "
+          "UNVERIFIED")
+    utf16_plain = mof(["Example-Pass-1"]).encode("utf-16-le")
+    verdict, found = mof_verdict(decode_text(utf16_plain))
+    check(verdict == UNVERIFIED and "NUL" in found[0][3],
+          "a UTF-16 MOF with no byte order mark is UNVERIFIED, not clean"
+          "  <-- pinned defect")
+    # Comments. DSP0221 clause 5.4: a comment is whitespace.
+    commented = ("/* instance of MSFT_Credential as $c\n{\nPassword = "
+                 "\"Example-Pass-1\";\n};\n*/\n"
+                 "// instance of MSFT_Credential as $d { Password = \"x\"; };\n"
+                 + mof([armoured]))
+    verdict, found = mof_verdict(commented)
+    check(verdict == MOF_ENCRYPTED and len(found) == 1,
+          "an instance written inside a comment is not a live credential"
+          "  <-- pinned defect")
+    check(found[0][0] == 11, "a finding after a block comment keeps its "
+          "true line number")
+    in_body = ("instance of MSFT_Credential as $c\n{\n// a note\nPassword = "
+               "/* a note */ \"Example-Pass-1\"; // end\n};\n")
+    verdict, found = mof_verdict(in_body)
+    check(verdict == MOF_PLAINTEXT and found[0][0] == 1,
+          "comments inside a credential body are skipped, and the "
+          "plaintext password behind them is found")
+    quoted_slashes = ("instance of MSFT_Credential as $c\n{\nPassword = "
+                      "\"a//b/*c\";\n};\n")
+    check(mof_verdict(quoted_slashes)[0] == MOF_PLAINTEXT,
+          "// and /* inside a string literal are not comments")
+    for text, label in (("/* never closed\ninstance of MSFT_Credential "
+                         "as $c\n{\nPassword = \"x\";\n};\n",
+                         "a block comment that is never closed"),
+                        ("/*/ x", "a block comment opened by a lone slash")):
+        verdict, found = mof_verdict(text)
+        check(verdict == UNVERIFIED and "never closed" in found[0][3],
+              "%s is UNVERIFIED, it cannot hide a credential" % label)
+    check(mof_verdict("/**/\n" + mof([armoured]))[0] == MOF_ENCRYPTED,
+          "an empty block comment is a comment")
+    check(strip_comments("a / b") == "a / b",
+          "a lone slash is not a comment")
+    # Password values that are not a string literal. None may echo a token.
+    for body, want, label in (
+            ("Password = Hunter2Pass;", MOF_PLAINTEXT, "an unquoted token"),
+            ("Password = 12345678;", MOF_PLAINTEXT, "an unquoted number"),
+            ("Password = ;", MOF_PLAINTEXT, "an empty unquoted value"),
+            ("Password = NULL;", UNVERIFIED, "NULL"),
+            ("Password = null;", UNVERIFIED, "lower case null"),
+            ("Password = $other;", UNVERIFIED, "a reference"),
+            ("Password = {\"Hunter2Pass\", \"b\"};", UNVERIFIED, "an array"),
+            ("Password = \"ab\\Xcd\";", UNVERIFIED, "an unknown escape")):
+        text = "instance of MSFT_Credential as $c\n{\n%s\n};\n" % body
+        verdict, found = mof_verdict(text)
+        shown = " ".join(str(part) for row in found for part in row)
+        check(verdict == want and "Hunter2Pass" not in shown
+              and "12345678" not in shown and "\\X" not in shown
+              and "other" not in shown and "X" not in found[0][3],
+              "%s is %s and its text never reaches the report"
+              "  <-- pinned defect" % (label, want))
+    check(mof_verdict("instance of MSFT_Credential as $c\n{\nPassword = "
+                      "\"Exam\"\n  \"ple\";\n};\n")[0] == MOF_PLAINTEXT,
+          "adjacent string literals join into one value")
+    check(mof_verdict("instance of MSFT_Credential as $c\n{\nPassword = "
+                      "\"a\\b\\fc\";\n};\n")[0] == MOF_PLAINTEXT,
+          "the backspace and form feed escapes are read")
+    for text, label in (("{\"a\" \"b\"", "an array that is never closed"),
+                        ("{\"a\" \"b\" 3}", "two values with no comma")):
+        raises(lambda: _mof_value(text, 0), "%s is refused" % label,
+               "array")
+    check(_mof_value("{ 1, \"a\" , }", 0) == (("array", 2), 12),
+          "an array of two values with a trailing comma is counted")
+    check(_mof_value("{}", 0) == (("array", 0), 2), "an empty array is read")
     no_alias = "instance of MSFT_Credential\n{\nPassword = \"x\";\n};\n"
     check(mof_verdict(no_alias)[1][0][1] == "(no alias)",
           "a credential without an alias is still found")
-    check(decode_mof(mof([armoured]).encode("utf-16")) == mof([armoured]),
+    check(decode_text(mof([armoured]).encode("utf-16")) == mof([armoured]),
           "a UTF-16 MOF with a BOM is read")
-    check(decode_mof(b"\xef\xbb\xbfabc") == "abc",
+    check(decode_text(b"\xef\xbb\xbfabc") == "abc",
           "a UTF-8 MOF with a BOM is read")
-    raises(lambda: decode_mof(b"\xff\x00abc"),
+    raises(lambda: decode_text(b"\xff\x00abc"),
            "a MOF that is neither UTF-8 nor UTF-16 is refused", "not UTF-8")
 
     # ---- probes, against real sockets and fake registries
@@ -1473,12 +1890,48 @@ def self_test():
     value, error = collect("tcp:127.0.0.1:%d" % open_port, ".")
     check(value is True and error is None,
           "the tcp collector reaches the stub through the fact key")
+    with contextlib.closing(urllib.request.urlopen(
+            "http://127.0.0.1:%d/" % open_port, timeout=5)) as reply:
+        check(reply.status == 200,
+              "the stub server answers a real HTTP request, so it is a "
+              "real server and not a bare socket")
+
+    def refused(address, timeout):
+        raise ConnectionRefusedError(10061, "refused")
+
+    def timed_out(address, timeout):
+        raise socket.timeout("timed out")
+
+    def unreachable(address, timeout):
+        raise OSError(101, "network is unreachable")
+
+    check(tcp_open("192.0.2.1", 1, connect=refused) is False,
+          "a refused connection is the one answer that means closed")
+    for fake, label in ((timed_out, "a timeout"),
+                        (unreachable, "an unreachable network")):
+        value, error = collect("tcp:192.0.2.1:1434", ".", {"tcp": (
+            lambda host, port, fake=fake: tcp_open(host, port,
+                                                   connect=fake))})
+        check(value is None and error is not None,
+              "%s is an error, not a closed port  <-- pinned defect" % label)
+    verdict, detail = evaluate(
+        {"fact": "tcp:192.0.2.1:1434", "op": "==", "value": False, "why": ""},
+        [("f.json", read_facts(facts_doc(errors={
+            "tcp:192.0.2.1:1434": "timeout"}), "node-a", now, 24.0))])
+    check(verdict == UNVERIFIED,
+          "a port that must be closed is UNVERIFIED when the probe timed out"
+          "  <-- pinned defect")
     server.shutdown()
     server.server_close()
 
     value, error = collect("disk_free_gb:.", ".")
     check(isinstance(value, float) and value >= 0 and error is None,
           "free space on this host's working directory is a number of GB")
+    gib = float(1024 ** 3)
+    check([disk_free_gb("x", usage=lambda p: type("U", (), {"free": int(n)})())
+           for n in (39.96 * gib, 40 * gib, 0)] == [39.9, 40.0, 0.0],
+          "free space is cut down to 0.1 GiB, so 39.96 does not meet 40"
+          "  <-- pinned defect")
     tmp = tempfile.mkdtemp(prefix="nodecheck-selftest-")
     value, error = collect("disk_free_gb:%s" % os.path.join(tmp, "absent"),
                            ".")
@@ -1529,7 +1982,7 @@ def self_test():
     value, error = collect("os.system", ".")
     check(isinstance(value, str) and value and error is None,
           "the operating system name is collected")
-    value, error = collect("local_admin:svc-gis", ".")
+    value, error = collect("local_admin:svc-example", ".")
     check(value is None and "supply it by hand" in error,
           "a fact with no collector asks to be supplied by hand")
 
@@ -1555,14 +2008,24 @@ def self_test():
 
     stamp = datetime.datetime(2026, 1, 31, 9, 30, 0,
                               tzinfo=datetime.timezone.utc)
-    doc = gather("node-a", ["os.machine", "local_admin:svc-gis"], tmp, stamp,
+    doc = gather("node-a", ["os.machine", "local_admin:svc-example"], tmp, stamp,
                  host="authoring-01")
     check(doc["gathered"] == "2026-01-31T09:30:00Z" and doc["node"] == "node-a"
           and "os.machine" in doc["facts"]
-          and "local_admin:svc-gis" in doc["errors"],
+          and "local_admin:svc-example" in doc["errors"],
           "gather records each fact as a value or as an error, never both")
     check(read_facts(doc, "node-a", now, 24.0)["problem"] is None,
           "what gather writes, read_facts accepts")
+    hand = json.loads(json.dumps(doc))
+    hand["gathered"] = format_time(now)
+    hand["errors"].pop("local_admin:svc-example")
+    hand["facts"]["local_admin:svc-example"] = ["svc-example"]
+    check(evaluate({"fact": "local_admin:svc-example", "op": "contains",
+                    "value": "svc-example", "why": ""},
+                   [("f.json", read_facts(hand, "node-a", now, 24.0))])[0]
+          == OBSERVED,
+          "a hand-supplied fact moved from errors to facts in the gathered "
+          "file is judged, the way the README says")
     check(gather("node-a", [], tmp, stamp)["gathered_on"] == platform.node(),
           "gather names the host it ran on")
 
@@ -1642,22 +2105,44 @@ def self_test():
           "gather --out --apply writes the facts file")
     check(not [n for n in os.listdir(tmp) if n.startswith(".nodecheck-")],
           "the write leaves no temporary file behind")
+    nested = os.path.join(tmp, "absent", "deeper", "x.json")
+    code, out, err = run_cli(["gather", table_path, "--node", "node-a",
+                              "--only", "disk", "--out", nested, "--apply"])
+    check(code == 0 and os.path.isfile(nested),
+          "gather --out --apply creates the folder it writes into, so the "
+          "first command in the README works on a fresh checkout"
+          "  <-- pinned defect")
+    before = open(table_path, "rb").read()
+    code, out, err = run_cli(["gather", table_path, "--node", "node-a",
+                              "--only", "disk", "--out", table_path,
+                              "--apply"])
+    check(code == 2 and "was not replaced" in err
+          and open(table_path, "rb").read() == before,
+          "gather --out aimed at the node table is refused and the table is "
+          "untouched  <-- pinned defect")
+    code, out, err = run_cli(["gather", table_path, "--node", "node-a",
+                              "--only", "disk", "--out", tmp, "--apply"])
+    check(code == 2 and "could not write" in err,
+          "gather --out aimed at a folder exits 2")
     code, out, err = run_cli(["gather", table_path, "--node", "node-a",
                               "--only", "disk", "--out",
-                              os.path.join(tmp, "absent", "x.json"),
+                              os.path.join(tmp, "enc.mof", "x.json"),
                               "--apply"])
     check(code == 2 and "could not write" in err,
-          "a facts file that cannot be written exits 2")
+          "a folder that cannot be made exits 2")
+    code, out, err = run_cli(["gather", table_path, "--node", "node-a",
+                              "--only", "disk", "--out", nested, "--apply"])
+    check(code == 0, "gather --out replaces an older facts file")
+    _write_atomic(os.path.join(tmp, "dir-target"), "x")
+    os.remove(os.path.join(tmp, "dir-target"))
+    os.mkdir(os.path.join(tmp, "dir-target"))
+    outcome = "replaced"
     try:
         _write_atomic(os.path.join(tmp, "dir-target"), "x")
-        os.remove(os.path.join(tmp, "dir-target"))
-        os.mkdir(os.path.join(tmp, "dir-target"))
-        _write_atomic(os.path.join(tmp, "dir-target"), "x")
-        replaced = True
     except OSError:
-        replaced = False
-    check(not replaced and not [n for n in os.listdir(tmp)
-                                if n.startswith(".nodecheck-")],
+        outcome = "refused"
+    check(outcome == "refused" and not [n for n in os.listdir(tmp)
+                                        if n.startswith(".nodecheck-")],
           "a failed replace removes its temporary file")
     code, out, err = run_cli(["gather", table_path, "--node", "node-a",
                               "--only", "tcp:"])
@@ -1686,6 +2171,73 @@ def self_test():
     code, out, err = run_cli(["mof", os.path.join(tmp, "absent.mof")])
     check(code == 2 and "absent.mof" in err, "a MOF that cannot be read "
           "exits 2")
+    code, out, err = run_cli(["mof", os.path.join(tmp, "enc.mof"),
+                              os.path.join(tmp, "absent.mof"),
+                              os.path.join(tmp, "plain.mof")])
+    check(code == 1 and "plain.mof: PLAINTEXT" in out
+          and "enc.mof: ENCRYPTED" in out and "absent.mof" in err,
+          "an unreadable MOF does not stop the run: a plaintext MOF after it "
+          "is still found and exits 1  <-- pinned defect")
+    code, out, err = run_cli(["mof", os.path.join(tmp, "absent.mof"),
+                              os.path.join(tmp, "nomark.mof")])
+    check(code == 2 and "nomark.mof: UNVERIFIED" in out,
+          "an unreadable MOF outranks an UNVERIFIED one, and both are "
+          "reported")
+    check([mof_exit(c) for c in ([], [0], [3], [2, 3], [3, 2, 1], [0, 3])]
+          == [0, 0, 3, 2, 1, 3],
+          "the MOF exit code ranks 1 over 2 over 3 over 0")
+    tmpfile("empty.mof", "")
+    code, out, err = run_cli(["mof", os.path.join(tmp, "empty.mof")])
+    check(code == 3 and "not a DSC MOF" in out,
+          "mof on an empty file exits 3, not 0  <-- pinned defect")
+    tmpfile("bare.mof", "instance of MSFT_Credential as $c\n{\nPassword = "
+            "Hunter2Pass;\nUserName = \"u\";\n};\n")
+    code, out, err = run_cli(["mof", os.path.join(tmp, "bare.mof")])
+    check(code == 1 and "Hunter2Pass" not in out + err,
+          "an unquoted password exits 1 and is never printed"
+          "  <-- pinned defect")
+    tmpfile("dup.json", "{\"format\": \"nodecheck/1\", \"nodes\": "
+            "[{\"name\": \"n\", \"requires\": [{\"fact\": \"x\", \"op\": "
+            "\"==\", \"value\": 1}], \"requires\": []}]}")
+    code, out, err = run_cli(["check", os.path.join(tmp, "dup.json")])
+    check(code == 2 and "appears twice" in err and "\"requires\"" in err,
+          "a node with two requires keys is refused, the first block of "
+          "checks is not dropped  <-- pinned defect")
+    tmpfile("dup-roles.json", "{\"format\": \"nodecheck/1\", \"roles\": "
+            "{\"a\": [], \"a\": []}, \"nodes\": [{\"name\": \"n\"}]}")
+    code, out, err = run_cli(["check", os.path.join(tmp, "dup-roles.json")])
+    check(code == 2 and "appears twice" in err,
+          "a role defined twice is refused  <-- pinned defect")
+    tmpfile("odd-facts.json", "{\"x\": 1, \"x\": 2}")
+    check_table = tmpfile("one.json", json.dumps({
+        "format": TABLE_FORMAT, "nodes": [{
+            "name": "node-a", "facts": ["odd-facts.json"],
+            "requires": [{"fact": "x", "op": "==", "value": 2}]}]}))
+    code, out, err = run_cli(["check", check_table])
+    check(code == 3 and "NOT USED: cannot read" in out
+          and "appears twice" in out,
+          "a facts file with a repeated key is not used, so 2 never wins"
+          "  <-- pinned defect")
+    for text, label in (("{\"x\": NaN}", "NaN"), ("{\"x\": 1e999}", "1e999"),
+                        ("{\"x\": -Infinity}", "-Infinity")):
+        tmpfile("odd-facts.json", text)
+        code, out, err = run_cli(["check", check_table])
+        check(code == 3 and "NOT USED: cannot read" in out,
+              "a facts file holding %s is not used, UNVERIFIED  "
+              "<-- pinned defect" % label)
+    tmpfile("odd-facts.json", json.dumps(facts_doc(
+        gathered=format_time(_utcnow()), facts={"x": 10 ** 400})))
+    code, out, err = run_cli(["check", check_table])
+    check(code == 1 and "Traceback" not in err,
+          "an integer of 400 digits in a facts file is judged, not a "
+          "traceback  <-- pinned defect")
+    tmpfile("big-age.json", "{\"format\": \"nodecheck/1\", "
+            "\"max_age_hours\": 1" + "0" * 400 + ", \"nodes\": "
+            "[{\"name\": \"n\"}]}")
+    code, out, err = run_cli(["check", os.path.join(tmp, "big-age.json")])
+    check(code == 64 and "max_age_hours" in err,
+          "a max age of 400 digits exits 64, not with a traceback"
+          "  <-- pinned defect")
 
     code, out, err = run_cli(["check", os.path.join(tmp, "absent.json")])
     check(code == 2, "a table that cannot be read exits 2")
@@ -1700,6 +2252,46 @@ def self_test():
     bom = tmpfile("bom.json", json.dumps(the_table), encoding="utf-8-sig")
     code, out, err = run_cli(["check", bom, "--node", "node-a"])
     check(code == 0, "a table saved with a byte order mark is read")
+    u16 = tmpfile("table16.json", json.dumps(the_table), encoding="utf-16")
+    code, out, err = run_cli(["check", u16, "--node", "node-a"])
+    check(code == 0, "a table saved as UTF-16 with a byte order mark is read")
+    code, out, err = run_cli(["example"])
+    example = load_table(json.loads(out))
+    check(code == 0 and out == EXAMPLE_TABLE and len(example["nodes"]) == 2
+          and example["nodes"][1]["facts"] == ["facts/node-b.json",
+                                               "facts/node-b-authoring.json"],
+          "the example command prints a node table that load_table accepts")
+    check(len(example["nodes"][0]["requirements"]) == 5
+          and example["nodes"][1]["requirements"][-1]["fact"]
+          == "license_seats",
+          "the example's roles and its own requires both reach the node")
+    odd = tmpfile("odd-why.json", json.dumps({
+        "format": TABLE_FORMAT, "nodes": [{
+            "name": "node-\u0416", "facts": ["u16.json", "nul.json"],
+            "requires": [{"fact": "x", "op": ">=", "value": 5,
+                          "why": "needs \u2265 5 \x1b[31mred"}]}]}))
+    tmpfile("u16.json", json.dumps(facts_doc(
+        node="node-\u0416", gathered=format_time(_utcnow()),
+        facts={"x": 1})), encoding="utf-16")
+    tmpfile("nul.json", json.dumps(facts_doc()), encoding="utf-16-le")
+    code, out, err = run_cli(["check", odd])
+    check(code == 1 and "FAIL" in out and "observed 1" in out,
+          "a facts file saved as UTF-16 with a byte order mark is read, as "
+          "Windows PowerShell 5 writes it  <-- pinned defect")
+    check("holds NUL characters" in out and "NOT USED" in out,
+          "a UTF-16 file with no byte order mark says why it is not read"
+          "  <-- pinned defect")
+    check(all(32 <= ord(c) < 127 or c == "\n" for c in out + err)
+          and "\\x1b[31mred" in out and "\\u2265" in out
+          and "node-\\u0416" in out,
+          "control characters and non-ASCII text in a why or a node name "
+          "are escaped, so the report is never cut short and never moves "
+          "the cursor  <-- pinned defect")
+    check(_plain("a\U0001f600\tb") == "a\\U0001f600\\x09b",
+          "a character beyond the first plane is escaped in full")
+    code, out, err = run_cli(["mof", os.path.join(tmp, "caf\xe9.mof")])
+    check(code == 2 and "caf\\xe9.mof" in err,
+          "a file name with a non-ASCII letter is escaped in an error")
     code, out, err = run_cli([])
     check(code == 64 and "name a command" in err,
           "no command is a usage error")

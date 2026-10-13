@@ -12,3 +12,5 @@ logs/
 credentials*
 *token*
 *.mof
+.coverage
+facts/
